@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Precizno praćenje tačke gledanja sa kalibracijom</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden; 
+    height: 100%; background: #111; color: #eee; font-family: sans-serif;
+    user-select: none;
+  }
+  #video {
+    position: fixed; top: 10px; left: 10px; width: 160px; border-radius: 8px; border: 2px solid #444;
+    z-index: 20;
+    transform: scaleX(-1); /* mirror */
+  }
+  #fullscreenCanvas {
+    position: fixed; top:0; left:0; width: 100vw; height: 100vh; 
+    background: #111; z-index: 10;
+  }
+  #info {
+    position: fixed; top: 10px; right: 10px; font-size: 16px; color: #0f0; z-index: 30;
+    background: rgba(0,0,0,0.5); padding: 6px 12px; border-radius: 6px;
+  }
+  #calibrationInstructions {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    color: #ccc; background: rgba(0,0,0,0.6); padding: 12px 24px; border-radius: 8px;
+    font-size: 18px; max-width: 90vw; text-align: center;
+    z-index: 30;
+  }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay playsinline muted></video>
+<canvas id="fullscreenCanvas"></canvas>
+<div id="info">Pokretanje...</div>
+<div id="calibrationInstructions"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('fullscreenCanvas');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+const calibInfo = document.getElementById('calibrationInstructions');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+// Indeksi iz Mediapipe face mesh
+const leftIrisIdx = [468, 469, 470, 471, 472];
+const rightIrisIdx = [473, 474, 475, 476, 477];
+const leftEyeIdx = [33, 133, 159, 145, 153, 154, 155, 173, 157];
+const rightEyeIdx = [362, 263, 387, 373, 380, 381, 382, 390, 374];
+
+// Helper functions
+function getPoint2D(landmark) {
+  return {x: landmark.x * canvas.width, y: landmark.y * canvas.height, z: landmark.z};
+}
+function centroid(points) {
+  const sum = points.reduce((acc, p) => ({x: acc.x+p.x, y: acc.y+p.y, z: acc.z+p.z}), {x:0,y:0,z:0});
+  return {x: sum.x/points.length, y: sum.y/points.length, z: sum.z/points.length};
+}
+function vecSubtract(a,b) { return {x:a.x-b.x, y:a.y-b.y, z:a.z-b.z}; }
+function vecAdd(a,b) { return {x:a.x+b.x, y:a.y+b.y, z:a.z+b.z}; }
+function vecScale(v,s) { return {x:v.x*s, y:v.y*s, z:v.z*s}; }
+function vecLength(v) { return Math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z); }
+function vecNormalize(v) { 
+  const len = vecLength(v); 
+  if(len === 0) return {x:0,y:0,z:0}; 
+  return {x: v.x/len, y: v.y/len, z: v.z/len};
+}
+function smooth(prev, cur, alpha=0.3) {
+  if(!prev) return cur;
+  return {
+    x: prev.x + alpha * (cur.x - prev.x),
+    y: prev.y + alpha * (cur.y - prev.y),
+    z: prev.z + alpha * (cur.z - prev.z)
+  };
+}
+function dot(a,b) {
+  return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+// Izračun offseta irisa u odnosu na oko
+function calculateIrisOffset(irisPoints, eyePoints) {
+  const irisC = centroid(irisPoints);
+  const eyeC = centroid(eyePoints);
+  let offsets = irisPoints.map(p => {
+    const p2d = getPoint2D(p);
+    const e2d = getPoint2D(eyeC);
+    return {
+      x: -(p2d.x - e2d.x),
+      y: p2d.y - e2d.y,
+      z: p.z - eyeC.z
+    };
+  });
+  const avg = offsets.reduce((acc, cur) => ({
+    x: acc.x + cur.x,
+    y: acc.y + cur.y,
+    z: acc.z + cur.z
+  }), {x:0,y:0,z:0});
+  return {
+    x: avg.x/offsets.length,
+    y: avg.y/offsets.length,
+    z: avg.z/offsets.length
+  };
+}
+
+// Intersect dva zraka
+function intersectRays(o1, d1, o2, d2) {
+  const w0 = vecSubtract(o1, o2);
+  const a = dot(d1, d1);
+  const b = dot(d1, d2);
+  const c = dot(d2, d2);
+  const d = dot(d1, w0);
+  const e = dot(d2, w0);
+  const denom = a*c - b*b;
+  if (Math.abs(denom) < 1e-6) {
+    return vecScale(vecAdd(o1,o2),0.5);
+  }
+  const t1 = (b*e - c*d) / denom;
+  const t2 = (a*e - b*d) / denom;
+  const p1 = vecAdd(o1, vecScale(d1, t1));
+  const p2 = vecAdd(o2, vecScale(d2, t2));
+  return vecScale(vecAdd(p1,p2), 0.5);
+}
+
+// Kalibracioni poeni na ekranu (u normiranim koordinatama 0-1)
+const calibPoints = [
+  {name: "gore-levo", screen: {x: 0.1, y: 0.1}},
+  {name: "gore-desno", screen: {x: 0.9, y: 0.1}},
+  {name: "dole-levo", screen: {x: 0.1, y: 0.9}},
+  {name: "dole-desno", screen: {x: 0.9, y: 0.9}},
+  {name: "centar", screen: {x: 0.5, y: 0.5}}
+];
+
+let calibIndex = 0;
+let calibData = [];
+let isCalibrated = false;
+let smoothedGazeDir = null;
+
+function clamp(val,min,max) { return val < min ? min : val > max ? max : val; }
+
+// Linearna interpolacija između dve tačke
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Funkcija za linearno mapiranje gaze offseta na koordinatu ekrana na osnovu kalibracionih tačaka
+function mapGazeToScreen(avgNormX, avgNormY) {
+  // Izvući offset vrednosti iz kalibracije za 4 uglova
+  // Pravimo linearne opsege za X i Y
+  const calibX = calibData.slice(0,4).map(d => ((d.left.x + d.right.x)/2));
+  const calibY = calibData.slice(0,4).map(d => ((d.left.y + d.right.y)/2));
+
+  const minX = Math.min(...calibX);
+  const maxX = Math.max(...calibX);
+  const minY = Math.min(...calibY);
+  const maxY = Math.max(...calibY);
+
+  // Normalizuj gaze offset
+  const normX = clamp((avgNormX - minX) / (maxX - minX), 0, 1);
+  const normY = clamp((avgNormY - minY) / (maxY - minY), 0, 1);
+
+  // Mapiraj na ekran
+  const screenX = lerp(calibPoints[0].screen.x * canvas.width, calibPoints[1].screen.x * canvas.width, normX);
+  const screenY = lerp(calibPoints[0].screen.y * canvas.height, calibPoints[2].screen.y * canvas.height, normY);
+
+  return {x: screenX, y: screenY};
+}
+
+// Glavna funkcija onResults
+function onResults(results) {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+    info.textContent = 'Nema lica u kadru.';
+    return;
+  }
+
+  const landmarks = results.multiFaceLandmarks[0];
+  const leftIris = leftIrisIdx.map(i => landmarks[i]);
+  const rightIris = rightIrisIdx.map(i => landmarks[i]);
+  const leftEye = leftEyeIdx.map(i => landmarks[i]);
+  const rightEye = rightEyeIdx.map(i => landmarks[i]);
+
+  const leftOffset = calculateIrisOffset(leftIris, leftEye);
+  const rightOffset = calculateIrisOffset(rightIris, rightEye);
+
+  // Kalibracija: snimi offset za svaku kalibracionu tačku
+  if(!isCalibrated) {
+    calibInfo.style.display = 'block';
+    calibInfo.textContent = `Kalibracija: Pogledaj tačku ${calibPoints[calibIndex].name.replace('-', ' ')} i drži pogled stabilno...`;
+    calibData[calibIndex] = {
+      left: {...leftOffset},
+      right: {...rightOffset}
+    };
+    calibIndex++;
+
+    if(calibIndex >= calibPoints.length) {
+      isCalibrated = true;
+      calibInfo.textContent = "Kalibracija završena. Sada prati tačku gledanja.";
+      setTimeout(() => { calibInfo.style.display = 'none'; }, 3000);
+    }
+    return;
+  }
+
+  // Normalizacija offseta u odnosu na centar (poslednja kalibraciona tačka)
+  const centerLeft = calibData[4].left;
+  const centerRight = calibData[4].right;
+
+  const normLeft = {
+    x: leftOffset.x - centerLeft.x,
+    y: leftOffset.y - centerLeft.y,
+    z: leftOffset.z - centerLeft.z
+  };
+  const normRight = {
+    x: rightOffset.x - centerRight.x,
+    y: rightOffset.y - centerRight.y,
+    z: rightOffset.z - centerRight.z
+  };
+
+  // Pravi pravce pogleda za oba oka
+  const scaleX = 1.5, scaleY = 1.0, scaleZ = 0.7;
+  const leftDir = vecNormalize({
+    x: normLeft.x * scaleX,
+    y: normLeft.y * scaleY,
+    z: -1 + normLeft.z * scaleZ
+  });
+  const rightDir = vecNormalize({
+    x: normRight.x * scaleX,
+    y: normRight.y * scaleY,
+    z: -1 + normRight.z * scaleZ
+  });
+
+  // Srednji pravac i glatka interpolacija
+  const gazeDirRaw = vecNormalize({
+    x: (leftDir.x + rightDir.x) / 2,
+    y: (leftDir.y + rightDir.y) / 2,
+    z: (leftDir.z + rightDir.z) / 2
+  });
+  smoothedGazeDir = smooth(smoothedGazeDir, gazeDirRaw, 0.25);
+
+  // Koordinate zenica u 2D
+  const leftIris2D = getPoint2D(centroid(leftIris));
+  const rightIris2D = getPoint2D(centroid(rightIris));
+
+  const depthScale = 1200;
+  const leftOrigin = {x: leftIris2D.x, y: leftIris2D.y, z: centroid(leftIris).z * depthScale};
+  const rightOrigin = {x: rightIris2D.x, y: rightIris2D.y, z: centroid(rightIris).z * depthScale};
+
+  // Presečna tačka zraka
+  const gazePoint3D = intersectRays(leftOrigin, smoothedGazeDir, rightOrigin, smoothedGazeDir);
+
+  // Izračunavanje prosečnih normiranih offseta (za mapiranje)
+  const avgNormX = (normLeft.x + normRight.x) / 2;
+  const avgNormY = (normLeft.y + normRight.y) / 2;
+
+  // Mapiranje na ekran koristeći linearnu interpolaciju između kalibracionih tačaka
+  // Ovo daje precizniji rezultat nego direktno normalizovanje po min/max
+  const screenPos = mapGazeToScreen(avgNormX, avgNormY);
+
+  // Iscrtavanje tačke gledanja
+  ctx.fillStyle = 'lime';
+  ctx.shadowColor = '#0f0';
+  ctx.shadowBlur = 15;
+  ctx.beginPath();
+  ctx.arc(screenPos.x, screenPos.y, 25, 0, 2 * Math.PI);
+  ctx.fill();
+
+  // Crtanje zraka
+  ctx.strokeStyle = 'cyan';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(leftOrigin.x, leftOrigin.y);
+  ctx.lineTo(leftOrigin.x + smoothedGazeDir.x * 100, leftOrigin.y + smoothedGazeDir.y * 100);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(rightOrigin.x, rightOrigin.y);
+  ctx.lineTo(rightOrigin.x + smoothedGazeDir.x * 100, rightOrigin.y + smoothedGazeDir.y * 100);
+  ctx.stroke();
+
+  info.textContent = `Gledaš u ekran na poziciji: (${screenPos.x.toFixed(0)}, ${screenPos.y.toFixed(0)})`;
+
+
+}
+
+// Pokretanje MediaPipe FaceMesh i kamere
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true,
+  minDetectionConfidence: 0.8,
+  minTrackingConfidence: 0.8
+});
+faceMesh.onResults(onResults);
+
+const camera = new Camera(video, {
+  onFrame: async () => {
+    await faceMesh.send({image: video});
+  },
+  width: 640,
+  height: 480
+});
+camera.start();
+
+// Resize handler
+window.addEventListener('resize', () => {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+});
+
+</script>
+</body>
+</html>
